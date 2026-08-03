@@ -6,8 +6,11 @@ Reads Marker-produced Markdown (with --paginate_output page markers) and
 Whisper transcripts (with [mm:ss] timestamp markers), splits them into
 SECTION-AWARE chunks that carry {title, author, source_id, part, section,
 page_start/page_end  OR  time_start/time_end} metadata, embeds each chunk
-locally with nomic-embed-text via Ollama (correct search_document: prefix),
-and writes everything into a persistent ChromaDB collection.
+locally with nomic-embed-text v1.5 through embedder.py (sentence-transformers
+by default, --backend ollama for the legacy route; the search_document: prefix
+is applied there), and writes everything into a persistent ChromaDB collection.
+
+Runs in the JunieAirport env on the Windows host.
 
 SERIES SUPPORT: a manifest `filename` may be a glob (e.g. "Lecture 13-*.mp4"),
 so one row covers a whole lecture course. Each matched file becomes a distinct

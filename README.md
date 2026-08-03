@@ -66,11 +66,23 @@ errors. Install everything above it with pip.
 weights land on the wrong drive:
 
 ```powershell
-[Environment]::SetEnvironmentVariable("HF_HOME", "F:\Dev\Cache\huggingface", "User")
+[Environment]::SetEnvironmentVariable("HF_HOME", "F:\Dev\Caches\huggingface", "User")
 ```
 
 New shell afterwards. Enabling Windows Developer Mode also restores symlink-based
 deduplication in that cache, which meaningfully cuts its size.
+
+### Smoke-test the embedder before anything else
+
+```powershell
+python embedder.py st        # expect: STEmbedder: dim=768
+```
+
+Downloads ~550 MB on first run. This settles three things you'd otherwise be
+assuming: that `trust_remote_code` is or isn't still needed on transformers
+5.14.1 (`embedder.py` handles either, but you want to know which branch fired),
+that the model lands in the relocated `HF_HOME`, and **what dimension you're
+about to bake into the collection permanently.**
 
 ## Embedding backend — pick one, use it everywhere
 
@@ -149,11 +161,14 @@ JunieLib/
 
 3. **Transcribe** (separately — shares the GPU with Marker):
    ```powershell
-   python transcribe.py --video video --out transcripts
+   python transcribe.py --video video --out transcripts ^
+       --prompt "Photogrammetry lecture: epipolar geometry, homography, bundle adjustment, Stachniss."
    ```
-   Keep `compute_type="float16"`. `int8` fails on Blackwell with
+   Keep `--compute-type float16`. `int8` fails on Blackwell with
    `CUBLAS_STATUS_NOT_SUPPORTED` — a CTranslate2/`sm_120` incompatibility, not a
    broken install.
+
+   See **Transcription quality** below before doing a full course.
 
 4. **Chunk + embed + index:**
    ```powershell
@@ -181,6 +196,54 @@ JunieLib/
    You want hits whose header line reads like a real book + section + page. If a
    book shows section but no page, its Marker output had no page markers (common
    for EPUBs — reflowable, so section-level is the honest granularity there).
+
+## Transcription quality
+
+For a citation index the relevant failure mode is not word error rate in
+general — it's **domain jargon**. Ordinary prose transcribes fine while the exact
+terms Junie searches on get mangled: "epipolar" → "epi-polar", XPBD →
+"X-P-B-D", author surnames anywhere at all. A wrong article costs nothing. A
+wrong technical term costs the retrieval, and it does so silently, because the
+transcript still reads plausibly.
+
+### `--prompt` is the biggest lever — bigger than model size
+
+`initial_prompt` seeds the decoder with vocabulary, biasing it toward terms you
+supply. One line per lecture series does more for citation quality than any
+model upgrade:
+
+```powershell
+python transcribe.py --video video\photogrammetry --out transcripts ^
+    --prompt "Lecture on epipolar geometry, homography, bundle adjustment, RANSAC, Stachniss."
+```
+
+*Future work:* a `prompt` column in `manifest.csv` so each series carries its own
+vocabulary automatically. `transcribe.py` doesn't read the manifest today.
+
+### Choosing a model
+
+| Model | VRAM | Notes |
+|---|---|---|
+| `large-v3` | ~4.7 GB | Default. Best accuracy. |
+| `large-v3-turbo` | notably less | A distillation of large-v3 with the decoder cut from 32 layers to 4. Several times faster, slightly less accurate — the gap is small on clean English, wider in some other languages. |
+| `medium` | ~2 GB | Fallback if VRAM is tight. |
+
+Turbo is a **speed** option, not an accuracy one — reaching for it when you want
+better transcripts moves you the wrong way. It earns its place if you have many
+hours of video and large-v3 proves to be the pipeline bottleneck. Decide that
+from the `Nx realtime` figure the script now prints after each file, not in
+advance. Models are downloads rather than packages, so switching is just
+`--model`; nothing to reinstall.
+
+### Repetition loops
+
+`condition_on_previous_text` is Whisper's default and is **off** here. It
+occasionally sends long lectures into a repetition loop, and a looped segment
+poisons its timestamps along with its text — which in this pipeline means a
+citation pointing at the wrong minute. Pass `--condition-on-previous` to restore
+the upstream default if you'd rather have the coherence.
+
+`--beam-size` defaults to 5, faster-whisper's own default; raising it buys little.
 
 ## Copying to the VM
 

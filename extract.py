@@ -4,7 +4,7 @@ extract.py -- Batch-convert PDFs/EPUBs to paginated Markdown with Marker.
 
 Wraps Marker's CLI so every source is converted identically: structured
 Markdown + page markers (--paginate_output), which the chunker turns into
-page citations. Runs on the RTX 5060 in the lmme_dl env.
+page citations. Runs on the RTX 5060 in the JunieAirport env.
 
   python extract.py --raw raw --out md
   python extract.py --raw raw --out md --force-ocr    # for scanned books
@@ -26,7 +26,7 @@ def main():
     args = ap.parse_args()
 
     if shutil.which("marker") is None:
-        sys.exit("marker CLI not found. In lmme_dl:  pip install marker-pdf")
+        sys.exit("marker CLI not found. In JunieAirport:  pip install marker-pdf")
 
     args.out.mkdir(parents=True, exist_ok=True)
     cmd = ["marker", str(args.raw),
