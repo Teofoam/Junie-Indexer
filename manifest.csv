@@ -1,0 +1,22 @@
+source_id,filename,title,author,type
+harris-ddca,8. Digital Design and Computer Architecture, RISC-V Edition — Sarah L Harris, David M Harris.pdf,Digital Design and Computer Architecture: RISC-V Edition,"Sarah L. Harris, David M. Harris",book
+chu-fpga,9. FPGA Prototyping by SystemVerilog Examples — Pong P Chu.epub,FPGA Prototyping by SystemVerilog Examples,Pong P. Chu,book
+patterson-hennessy,10. Computer Organization and Design RISC-V Edition — David A Patterson, John L Hennessy.pdf,Computer Organization and Design RISC-V Edition: The Hardware Software Interface,"David A. Patterson, John L. Hennessy",book
+bryant-ohallaron,11. Computer Systems _ A Programmer's Perspective (3rd Edition) — Randal E Bryant, David R O’Hallaron.pdf,Computer Systems: A Programmer's Perspective,"Randal E. Bryant, David R. O'Hallaron",book
+hubbard-vectcalc,12. Vector Calculus, Linear Algebra, and Differential Forms _ A Unified Approach — John Hubbard, Barbara Burke Hubbard.pdf,"Vector Calculus, Linear Algebra, and Differential Forms: A Unified Approach","John H. Hubbard, Barbara Burke Hubbard",book
+oppenheim-sigsys-book,13. Signals and Systems — Alan V Oppenheim.pdf,Signals and Systems,"Alan V. Oppenheim, Alan S. Willsky, S. Hamid Nawab",book
+hwu-mppp,16. Programming Massively Parallel Processors (4th Edition) — Wen-mei W Hwu, David B Kirk, Izzat El Hajj.pdf,Programming Massively Parallel Processors: A Hands-on Approach,"Wen-mei W. Hwu, David B. Kirk, Izzat El Hajj",book
+richter-gebert,18. Perspectives on Projective Geometry _ A Guided Tour Through — Jürgen Richter-Gebert.pdf,Perspectives on Projective Geometry,"Jürgen Richter-Gebert",book
+gaoxiang-slam14,20. 14 Lectures on Visual SLAM _ From Theory to Practice — Xiang Gao, Tao Zhang, Yi Liu, Qinrui Yan.pdf,视觉SLAM十四讲：从理论到实践,"高翔, 张涛, 刘毅, 颜沁睿",book
+marschner-shirley,21. Fundamentals of Computer Graphics _ International Student — Steve Marschner, Peter Shirley.pdf,Fundamentals of Computer Graphics,"Steve Marschner, Peter Shirley",book
+shirley-rtow,23a. Ray Tracing in One Weekend — Peter Shirley.pdf,Ray Tracing in One Weekend,Peter Shirley,book
+samet-multidim,65. Foundations of Multidimensional and Metric Data Structures — Hanan Samet.pdf,Foundations of Multidimensional and Metric Data Structures,Hanan Samet,book
+museth-vdb,66. VDB _ High-Resolution Sparse Volumes with Dynamic Topology — Ken Museth.pdf,VDB: High-Resolution Sparse Volumes with Dynamic Topology,Ken Museth,paper
+boyd-cvxopt,71. Convex Optimization — Stephen Boyd, Lieven Vandenberghe.pdf,Convex Optimization,"Stephen Boyd, Lieven Vandenberghe",book
+nocedal-wright,72. Numerical Optimization — Jorge Nocedal, Stephen J Wright.pdf,Numerical Optimization,"Jorge Nocedal, Stephen J. Wright",book
+absil-manifolds,73. Optimization Algorithms on Matrix Manifolds — Pierre-Antoine Absil, Robert Mahony, Rodolphe Sepulchre.pdf,Optimization Algorithms on Matrix Manifolds,"Pierre-Antoine Absil, Robert Mahony, Rodolphe Sepulchre",book
+ebert-texturing,78. Texturing and Modeling _ A Procedural Approach — David S Ebert, F Kenton Musgrave, Darwyn Peachey, Ken Perlin, Steven Worley.pdf,Texturing and Modeling: A Procedural Approach,"David S. Ebert, F. Kenton Musgrave, Darwyn Peachey, Ken Perlin, Steven Worley",book
+shaker-pcg,79. Procedural Content Generation in Games — Noor Shaker, Julian Togelius, Mark J Nelson.pdf,Procedural Content Generation in Games,"Noor Shaker, Julian Togelius, Mark J. Nelson",book
+karth-wfc,80. WaveFunctionCollapse is Constraint Solving in the Wild — Isaac Karth, Adam M Smith.pdf,WaveFunctionCollapse is Constraint Solving in the Wild,"Isaac Karth, Adam M. Smith",paper
+blake-mrf,90. Markov Random Fields for Vision and Image Processing — Andrew Blake, Pushmeet Kohli, Carsten Rother.pdf,Markov Random Fields for Vision and Image Processing,"Andrew Blake, Pushmeet Kohli, Carsten Rother",book
+oppenheim-sigsys,Lecture 13-*.mp4,Signals and Systems Lecture Series,Alan V. Oppenheim,lecture
