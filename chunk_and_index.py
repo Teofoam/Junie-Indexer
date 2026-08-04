@@ -229,8 +229,9 @@ def main():
     exact, globs = load_manifest(args.manifest)
 
     def _not_scratch(p: Path, root: Path) -> bool:
-        # skip _underscore dirs (e.g. a crashed extract run's temp folders)
-        return not any(part.startswith("_") for part in p.relative_to(root).parts)
+        # Skip _underscore DIRECTORIES (a crashed extract run's temp folders).
+        # parts[:-1] so a legitimately-named file like _notes.md still indexes.
+        return not any(part.startswith("_") for part in p.relative_to(root).parts[:-1])
 
     files = []
     if args.md.exists():

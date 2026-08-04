@@ -177,9 +177,19 @@ JunieLib/
    converts each in a **fresh marker subprocess** (~3 GB peak, fully returned to
    the OS on exit), and stitches the chunks back with global page numbering —
    `{N}` markers and `_page_N_…` image names are offset to true PDF page
-   indices, so citations stay correct. Runs smallest-book-first and skips books
-   whose stitched `.md` already exists, so interrupting and re-running is safe.
+   indices, so citations stay correct. Runs smallest-book-first.
    `extract.py` remains for single papers, where whole-file conversion is fine.
+
+   **Resume is per-chunk, not per-book.** Finished chunks get a `.chunk_done`
+   sentinel, so a crash on chunk 7 of a 1000-page textbook re-does only chunk 7
+   — which matters, because big books are exactly why chunking exists. A chunk
+   directory without its sentinel is treated as a truncated write and redone.
+   Scratch lives at `./_chunk_scratch/`, deliberately outside `md/`
+   (`chunk_and_index.py` rglobs `md/`, and stray fragments would index as extra
+   documents with chunk-local page numbers). `JUNIELIB_SCRATCH` names a *parent*
+   to put it in — the script only ever deletes its own `_chunk_scratch`
+   subdirectory, never the path you hand it. Scratch is kept when a book fails,
+   so re-running resumes; `--keep-scratch` keeps it after success too.
 
    **Then verify the page markers before indexing anything.** Verified on
    marker 1.10.2: output pages look like `{N}` + 48 dashes, which
@@ -187,6 +197,17 @@ JunieLib/
    `_page_N_<Type>_<i>.jpeg`. Re-verify once after any marker version change —
    if the format drifts, every page citation in the corpus is silently wrong,
    which looks exactly like success.
+
+   Check the marker's **direction** too, which is a separate question from
+   whether the regex matches: `parse_segments` assumes `{N}----` *precedes* the
+   content of page N. If marker actually emits it as a page *terminator*, every
+   citation lands one page late. Open a converted `.md`, find `{5}----`, and
+   confirm the text after it is what's on page 5 of the PDF — not page 6.
+   A cheap way to see boundaries clearly:
+
+   ```powershell
+   python extract_chunked.py --raw raw --out md --limit 1 --chunk-pages 10 --keep-scratch
+   ```
 
 3. **Transcribe** (separately — shares the GPU with Marker):
    ```powershell
@@ -348,3 +369,11 @@ printed there corrupts the framing.
   server's dimension check exists to catch.
 - **8 GB VRAM.** Marker (~5 GB) and Whisper large-v3 (~4.7 GB) don't co-reside.
   Sequence them; that's why they're separate scripts.
+- **PDF page ≠ printed page. Unresolved.** Marker numbers PDF pages, but a
+  textbook's printed numbering starts after front matter, so `p. 239` in a
+  citation may be printed page 225. Running headers are stripped from the output
+  (`--keep_pagefooter_in_output` defaults False), so the printed number isn't
+  recoverable from the markdown — it needs a per-book `page_offset` column in
+  `manifest.csv` and one subtraction in `process_file`. The offset is constant
+  per book, so this is cheap to add and expensive to retrofit: fixing it later
+  means re-indexing. Check one citation against the real PDF during the pilot.
