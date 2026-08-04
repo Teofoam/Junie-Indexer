@@ -174,7 +174,7 @@ JunieLib/
    `MemoryError`, and the poisoned worker then fails every later file on
    tiny allocations — `--workers 1` guards VRAM but nothing guards system RAM.
    The chunked wrapper splits each PDF into 150-page chunks (`--chunk-pages`),
-   converts each in a **fresh marker subprocess** (~3 GB peak, fully returned to
+   converts each in a **fresh marker subprocess** (~6 GB peak, fully returned to
    the OS on exit), and stitches the chunks back with global page numbering —
    `{N}` markers and `_page_N_…` image names are offset to true PDF page
    indices, so citations stay correct. Runs smallest-book-first.
@@ -358,7 +358,15 @@ printed there corrupts the framing.
   that uses those SDKs directly gets the older majors.
 - **System RAM, not just VRAM, is a ceiling.** Marker's up-front page rendering
   is why `extract_chunked.py` exists; peak commit scales with `--chunk-pages`
-  (~13 MB/page at 192 DPI), not with book size. 150 pages ≈ 2–3 GB.
+  (~13 MB/page at 192 DPI plus the models), not with book size. **Measured: 150
+  pages ≈ 6 GB working set** on a 1137-page textbook — budget from that, not
+  from the page arithmetic alone.
+- **Watch the commit charge, not just "available" RAM.** With a 4 GB pagefile
+  this box runs ~32/35 GB committed during a chunk — 91%, while Task Manager
+  still reports 12 GB "available". Commit exhaustion is what produced the
+  original `MemoryError` (and took PyCharm's JVM down with it), so if you run
+  anything heavy alongside a conversion, raise the pagefile rather than trusting
+  the available figure.
 - **`Failed to start MPS server` warning on Windows is noise** — NVIDIA MPS is
   Linux-only; marker tries it and falls back cleanly.
 - **Pillow is held at `<11`** by marker-pdf. Anything later needing Pillow ≥11 will
