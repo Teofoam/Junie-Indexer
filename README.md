@@ -15,7 +15,7 @@ embedding — and hands the VM a finished index. The VM never touches the GPU.
 ## What each stage does
 
 ```
-raw/ (PDF, EPUB) ──extract.py──▶ md/            (Marker: structured MD + page markers)
+raw/ (PDF, EPUB) ──extract_chunked.py──▶ md/    (Marker: structured MD + page markers)
 video/ (mp4…)   ──transcribe.py─▶ transcripts/  (Whisper: MD + [mm:ss] markers)
                                        │
                        chunk_and_index.py  (section-aware chunks + {title,section,page/time})
@@ -40,7 +40,7 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 python -c "import torch; print(torch.version.cuda, torch.cuda.get_device_capability(0))"
 #  -> 13.0 (12, 0)
 
-pip install marker-pdf chromadb sentence-transformers tqdm ^
+pip install "marker-pdf<2" chromadb sentence-transformers tqdm ^
             --extra-index-url https://download.pytorch.org/whl/cu130
 python -c "import torch; print(torch.version.cuda)"   # still 13.0?
 
@@ -51,6 +51,18 @@ pip install faster-whisper
 torch from PyPI as a transitive dependency; the later cu130 command then reports
 "Requirement already satisfied" and silently does nothing. Torch first, everything
 else after.
+
+**Why marker-pdf is pinned below 2.** marker 2.0 stopped running its models
+in-process: it spawns an OpenAI-compatible inference server and, on any machine
+with an NVIDIA GPU, that means the `vllm/vllm-openai` **Docker image** — no
+Docker, no conversion (`SpawnError: docker binary not found`). The non-Docker
+fallback (`SURYA_INFERENCE_BACKEND=llamacpp`) needs a separately installed
+`llama-server` binary, and vllm's memory tuning starts at 16 GB cards anyway.
+marker 1.x (currently resolves to 1.10.2) is the in-process torch pipeline this
+project was built on and runs the 5060 directly. The downgrade was verified
+safe: `pip check` clean, embedder output bit-identical before/after. Revisit 2.x
+only with a `llama-server` CUDA build installed, or on hardware where vllm makes
+sense.
 
 **Why the RTX 5060 forces CUDA 13.** Blackwell is compute capability 12.0 (`sm_120`).
 Wheels built against CUDA 12.6 or older contain no kernels for it — they install
@@ -79,10 +91,13 @@ python embedder.py st        # expect: STEmbedder: dim=768
 ```
 
 Downloads ~550 MB on first run. This settles three things you'd otherwise be
-assuming: that `trust_remote_code` is or isn't still needed on transformers
-5.14.1 (`embedder.py` handles either, but you want to know which branch fired),
-that the model lands in the relocated `HF_HOME`, and **what dimension you're
-about to bake into the collection permanently.**
+assuming: that `trust_remote_code` does or doesn't work on whatever transformers
+the marker pin resolved (4.57.x under marker 1.x — verified to produce vectors
+bit-identical to transformers 5.14's; `embedder.py` handles either branch), that
+the model lands in the relocated `HF_HOME`, and **what dimension you're about to
+bake into the collection permanently.** Re-run it after any pip operation that
+touches transformers or huggingface-hub — same first four vector components =
+the index is still valid.
 
 ## Embedding backend — pick one, use it everywhere
 
@@ -131,6 +146,7 @@ JunieLib/
 ├── raw/            # your PDFs and EPUBs
 ├── video/          # lecture video/audio files
 ├── manifest.csv    # maps each file -> title / author / type (edit this!)
+├── extract_chunked.py    # RAM-safe batch extraction (use this for books)
 ├── extract.py  transcribe.py  chunk_and_index.py  query_test.py
 ├── embedder.py     # shared embedding backend (st | ollama)
 ├── library_mcp.py  # VM-side MCP server (ships to Cozy-Library, not run here)
@@ -149,15 +165,28 @@ JunieLib/
 
 2. **Extract** (run with the VM powered off to free its 12 GB):
    ```powershell
-   python extract.py --raw raw --out md
-   python extract.py --raw raw --out md --force-ocr   # for scanned books
+   python extract_chunked.py --raw raw --out md
+   python extract_chunked.py --raw raw --out md --force-ocr   # for scanned books
    ```
-   **Then verify the page markers before indexing anything.** Open a file in `md/`
-   and confirm they look like `{N}----…`. This is `marker-pdf 2.0.0`, a major
-   version ahead of what `PAGE_MARKER` was written against — treat the regex *and*
-   the `--paginate_output` flag as unverified until you've seen real output. If the
-   format changed, every page citation in the corpus is silently wrong, which looks
-   exactly like success.
+   Use `extract_chunked.py`, not `extract.py`, for anything book-sized. Marker
+   renders **every page of a document to a 192-DPI bitmap in RAM before
+   converting** (~13 MB/page): a 1000-page textbook commits >13 GB, dies with
+   `MemoryError`, and the poisoned worker then fails every later file on
+   tiny allocations — `--workers 1` guards VRAM but nothing guards system RAM.
+   The chunked wrapper splits each PDF into 150-page chunks (`--chunk-pages`),
+   converts each in a **fresh marker subprocess** (~3 GB peak, fully returned to
+   the OS on exit), and stitches the chunks back with global page numbering —
+   `{N}` markers and `_page_N_…` image names are offset to true PDF page
+   indices, so citations stay correct. Runs smallest-book-first and skips books
+   whose stitched `.md` already exists, so interrupting and re-running is safe.
+   `extract.py` remains for single papers, where whole-file conversion is fine.
+
+   **Then verify the page markers before indexing anything.** Verified on
+   marker 1.10.2: output pages look like `{N}` + 48 dashes, which
+   `PAGE_MARKER` in `chunk_and_index.py` matches, and image files are named
+   `_page_N_<Type>_<i>.jpeg`. Re-verify once after any marker version change —
+   if the format drifts, every page citation in the corpus is silently wrong,
+   which looks exactly like success.
 
 3. **Transcribe** (separately — shares the GPU with Marker):
    ```powershell
@@ -301,6 +330,16 @@ printed there corrupts the framing.
 
 ## Known pins and gotchas
 
+- **marker-pdf is pinned `<2`** (see *Building the env* for why). The pin drags
+  the whole neighborhood: transformers 4.57.x, huggingface-hub 0.36.x,
+  `openai` 1.x, `anthropic` 0.46, `google-genai` 1.x, pypdfium2 4.30. The
+  embedder is verified unaffected, but any *other* script sharing `JunieAirport`
+  that uses those SDKs directly gets the older majors.
+- **System RAM, not just VRAM, is a ceiling.** Marker's up-front page rendering
+  is why `extract_chunked.py` exists; peak commit scales with `--chunk-pages`
+  (~13 MB/page at 192 DPI), not with book size. 150 pages ≈ 2–3 GB.
+- **`Failed to start MPS server` warning on Windows is noise** — NVIDIA MPS is
+  Linux-only; marker tries it and falls back cleanly.
 - **Pillow is held at `<11`** by marker-pdf. Anything later needing Pillow ≥11 will
   conflict; that pin is marker's, not yours to relax.
 - **Matryoshka truncation.** v1.5 supports truncating 768-d output to 512/256/128

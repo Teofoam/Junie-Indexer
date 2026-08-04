@@ -26,7 +26,7 @@ def main():
     args = ap.parse_args()
 
     if shutil.which("marker") is None:
-        sys.exit("marker CLI not found. In JunieAirport:  pip install marker-pdf")
+        sys.exit("marker CLI not found. In JunieAirport:  pip install 'marker-pdf<2'")
 
     args.out.mkdir(parents=True, exist_ok=True)
     cmd = ["marker", str(args.raw),
