@@ -35,6 +35,7 @@ env/
 # ==========================================
 .idea/
 .vscode/
+.gemini/
 *.suo
 *.ntvs*
 *.njsproj
