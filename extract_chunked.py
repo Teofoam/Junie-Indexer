@@ -90,7 +90,10 @@ def process_book(src: Path, out_root: Path, chunk_pages: int, scratch: Path,
         print(f"  [chunk {i}/{len(chunks)}] pages {offset}-{min(offset + chunk_pages, n_pages) - 1}")
         chunk_out = workdir / f"out_{offset:05d}"
         md = convert_chunk(chunk_pdf, chunk_out, extra_flags)
-        stitched.append(offset_page_refs(md.read_text(encoding="utf-8"), offset))
+        # rstrip+"\n\n" guards the next chunk's {N}---- marker landing mid-line:
+        # PAGE_MARKER in chunk_and_index.py is line-anchored, and a welded marker
+        # would silently inherit the previous page's number.
+        stitched.append(offset_page_refs(md.read_text(encoding="utf-8"), offset).rstrip("\n") + "\n\n")
         for img in md.parent.iterdir():
             if img.suffix.lower() in (".jpeg", ".jpg", ".png", ".webp", ".gif"):
                 images.append((img, IMAGE_TOKEN.sub(
@@ -125,8 +128,18 @@ def main():
     if args.use_llm:
         extra.append("--use_llm")
 
-    scratch = Path(os.environ.get("JUNIELIB_SCRATCH", args.out / "_chunk_scratch"))
+    # Scratch must live OUTSIDE --out: chunk_and_index.py rglobs md/ for *.md,
+    # and an interrupted run would leave per-chunk fragments there that index
+    # as extra documents with chunk-local (wrong) page numbers.
+    scratch = Path(os.environ.get("JUNIELIB_SCRATCH", args.raw.parent / "_chunk_scratch"))
+
     books = sorted(args.raw.glob("*.pdf"), key=lambda p: p.stat().st_size)
+    others = [p.name for p in args.raw.iterdir()
+              if p.is_file() and p.suffix.lower() != ".pdf"]
+    if others:
+        print(f"note: {len(others)} non-PDF file(s) in {args.raw}/ skipped -- "
+              f"page-splitting needs PDFs; convert these with extract.py:",
+              *others, sep="\n  ")
     if args.limit:
         books = books[: args.limit]
     print(f"{len(books)} book(s) to process (smallest first)")

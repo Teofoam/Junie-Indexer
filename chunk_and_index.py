@@ -228,11 +228,15 @@ def main():
 
     exact, globs = load_manifest(args.manifest)
 
+    def _not_scratch(p: Path, root: Path) -> bool:
+        # skip _underscore dirs (e.g. a crashed extract run's temp folders)
+        return not any(part.startswith("_") for part in p.relative_to(root).parts)
+
     files = []
     if args.md.exists():
-        files += [(p, "book")    for p in sorted(args.md.rglob("*.md"))]
+        files += [(p, "book")    for p in sorted(args.md.rglob("*.md")) if _not_scratch(p, args.md)]
     if args.transcripts.exists():
-        files += [(p, "lecture") for p in sorted(args.transcripts.rglob("*.md"))]
+        files += [(p, "lecture") for p in sorted(args.transcripts.rglob("*.md")) if _not_scratch(p, args.transcripts)]
     if not files:
         sys.exit("No .md found in md/ or transcripts/. Run extract.py / transcribe.py first.")
 
