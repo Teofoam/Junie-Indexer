@@ -17,6 +17,11 @@ This matters because the whole reason for chunking is that big books are
 where conversion falls over -- losing six converted chunks to a crash on
 the seventh would defeat the point.
 
+Scratch is keyed by book name, source file size, AND --chunk-pages, so
+changing the chunk size (or replacing a PDF) starts that book's chunks
+fresh instead of reusing incompatible parts; finished books are never
+touched either way.
+
   python extract_chunked.py --raw raw --out md
   python extract_chunked.py --raw raw --out md --limit 1 --chunk-pages 10  # smoke test
   python extract_chunked.py --raw raw --out md --force-ocr    # for scanned books
@@ -25,7 +30,7 @@ the seventh would defeat the point.
 Requires marker-pdf 1.x. 2.x routes OCR through a VLM inference server
 (vLLM in Docker), which this wrapper does not drive -- see README.
 """
-import argparse, os, re, shutil, subprocess, sys
+import argparse, hashlib, os, re, shutil, subprocess, sys
 from functools import lru_cache
 from pathlib import Path
 
@@ -43,6 +48,21 @@ IMAGE_EXTS = (".jpeg", ".jpg", ".png", ".webp", ".gif")
 
 def slug(s: str) -> str:
     return re.sub(r"-+", "-", re.sub(r"[^A-Za-z0-9]+", "-", s)).strip("-")[:80] or "book"
+
+
+def book_workdir(scratch: Path, src: Path, chunk_pages: int) -> Path:
+    """Per-book scratch dir, keyed so stale resume state can never be misapplied.
+
+    - name hash: keeps distinct books apart even when slug() collapses them
+      (two all-CJK titles would otherwise both become "book" and cross-stitch
+      each other's sentineled chunks);
+    - file size: a replaced source PDF invalidates the old parts;
+    - chunk size: parts and sentinels from a different --chunk-pages would
+      stitch with silently missing pages (a 10-page part_00000 reused by a
+      150-page run loses pages 10-149).
+    """
+    name_key = hashlib.md5(src.name.encode("utf-8")).hexdigest()[:8]
+    return scratch / f"{slug(src.stem)}-{name_key}-{src.stat().st_size}-c{chunk_pages}"
 
 
 # ---- marker capability probing --------------------------------------------
@@ -157,7 +177,7 @@ def process_book(src: Path, out_root: Path, chunk_pages: int, scratch: Path,
 
     # Stable per-book workdir, NOT wiped on entry: that is what makes a
     # re-run after a crash resume instead of starting the book over.
-    workdir = scratch / slug(src.stem)
+    workdir = book_workdir(scratch, src, chunk_pages)
     parts_root, chunk_out_root = workdir / "parts", workdir / "out"
     workdir.mkdir(parents=True, exist_ok=True)
 
