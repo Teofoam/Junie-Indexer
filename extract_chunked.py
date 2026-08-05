@@ -26,11 +26,24 @@ touched either way.
   python extract_chunked.py --raw raw --out md --limit 1 --chunk-pages 10  # smoke test
   python extract_chunked.py --raw raw --out md --force-ocr    # for scanned books
   python extract_chunked.py --raw raw --out md --keep-scratch # keep chunk output to inspect
+  python extract_chunked.py --raw raw --out md --log run.log  # tee everything to a file
+
+VRAM: on cards under 14GB we cap surya's inference batch sizes ourselves,
+because marker will not -- see BATCH_CAPS. Without that, an 8GB card runs
+the full CUDA defaults and overcommits, and the driver pages the overflow
+into host RAM over PCIe rather than raising OOM.
+
+This caps memory, NOT time. Measured on a 150-page chunk of dense text:
+57:30 with the caps against a 59:09 mean without, i.e. no effect, well
+inside the 37:25-77:57 per-chunk spread. Runtime tracks content density
+instead (0.042 pages/sec dense vs 0.93 light). Do not treat these caps as
+a speed fix -- see the throughput gotcha in the README.
 
 Requires marker-pdf 1.x. 2.x routes OCR through a VLM inference server
 (vLLM in Docker), which this wrapper does not drive -- see README.
 """
-import argparse, hashlib, os, re, shutil, subprocess, sys
+import argparse, hashlib, os, re, shutil, subprocess, sys, time
+from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 
@@ -44,6 +57,32 @@ PAGE_MARKER = re.compile(r"^\{(\d+)\}(-{10,})\s*$", re.M)
 IMAGE_TOKEN = re.compile(r"_page_(\d+)_")
 DONE = ".chunk_done"          # sentinel: this chunk converted completely
 IMAGE_EXTS = (".jpeg", ".jpg", ".png", ".webp", ".gif")
+
+# ---- VRAM caps -------------------------------------------------------------
+# marker/utils/batch.py picks batch sizes like this:
+#
+#     workers = max(1, vram // 7)        # vram from nvidia-smi, int GB
+#     if workers == 1:
+#         return {}, workers            # <-- no caps at all
+#
+# so its conservative numbers are applied ONLY when the card can hold two or
+# more 7GB workers, i.e. >=14GB. Below that you get surya's raw CUDA defaults
+# (recognition 256, ocr_error 64, detection 36, layout/table_rec 32), which do
+# not fit in 8GB. That is backwards, and marker's `--workers 1` does not help:
+# convert.py computes the batch sizes BEFORE applying the workers override.
+#
+# These are marker's own safe values, sized for a ~7GB budget, which is what a
+# single worker on an 8GB card actually has. Applied as env defaults so an
+# explicit setting in the caller's shell still wins.
+BATCH_CAPS = {
+    "RECOGNITION_BATCH_SIZE": "64",
+    "DETECTOR_BATCH_SIZE": "8",
+    "LAYOUT_BATCH_SIZE": "12",
+    "TABLE_REC_BATCH_SIZE": "12",
+    "OCR_ERROR_BATCH_SIZE": "12",
+}
+CAP_BELOW_VRAM_GB = 14        # the window where marker skips its own caps
+EQUATION_BATCH_SIZE = "16"    # marker-side; a CLI flag, not a surya env var
 
 
 def slug(s: str) -> str:
@@ -102,6 +141,100 @@ def check_marker_version() -> None:
             "  pip install 'marker-pdf<2'")
 
 
+@lru_cache(maxsize=1)
+def gpu_vram_gb() -> int:
+    """Total VRAM in whole GB, or 0 if there is no CUDA card to ask about.
+
+    Deliberately shells out to nvidia-smi rather than importing torch: this
+    runs in the parent process, and initialising CUDA here just to read a
+    number would hold a context for the whole run, against a budget that is
+    already the thing we are trying not to overspend.
+
+    int() truncation matches marker's own reading of the same value, so our
+    threshold and its `vram // 7` agree about which side of the line a card
+    falls on (an 8151MiB card reads as 7GB to both).
+    """
+    if shutil.which("nvidia-smi") is None:
+        return 0
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=60, check=True)
+        return int(int(r.stdout.strip().splitlines()[0]) / 1024)
+    except Exception:
+        return 0
+
+
+def marker_env() -> dict:
+    """Environment for the marker subprocess, with batch caps applied.
+
+    setdefault, not assignment: if you exported RECOGNITION_BATCH_SIZE
+    yourself you meant it, and this should not quietly overrule you.
+    """
+    env = os.environ.copy()
+    vram = gpu_vram_gb()
+    if 0 < vram < CAP_BELOW_VRAM_GB:
+        for k, v in BATCH_CAPS.items():
+            env.setdefault(k, v)
+    return env
+
+
+# ---- logging ---------------------------------------------------------------
+
+def stamp(msg: str) -> None:
+    print(f"[{datetime.now():%H:%M:%S}] {msg}")
+
+
+class Tee:
+    """Mirror a stream to a log file.
+
+    Installed over sys.stdout/sys.stderr so the wrapper's own output, marker's
+    output, and tracebacks all land in one file in the order they happened --
+    the point being that a run that misbehaves overnight leaves evidence
+    behind instead of requiring live process forensics.
+    """
+
+    def __init__(self, stream, fh):
+        self.stream, self.fh = stream, fh
+
+    def write(self, s):
+        self.stream.write(s)
+        self.stream.flush()
+        self.fh.write(s)
+        self.fh.flush()
+        return len(s)
+
+    def flush(self):
+        self.stream.flush()
+        self.fh.flush()
+
+    def isatty(self):
+        return self.stream.isatty()
+
+
+def run_streaming(cmd: list[str], env: dict) -> None:
+    """Run cmd, relaying output line by line, and raise on non-zero exit.
+
+    Streamed rather than captured: a chunk takes the better part of an hour,
+    and subprocess.run(capture_output=True) would withhold every line of it
+    until the end -- exactly when it stops being useful. Writing to
+    sys.stdout (not the file directly) keeps Tee as the single place that
+    decides where output goes.
+    """
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace",
+                            bufsize=1, env=env)
+    for line in proc.stdout:
+        sys.stdout.write(line)
+    rc = proc.wait()
+    if rc != 0:
+        raise subprocess.CalledProcessError(rc, cmd)
+
+
+def fmt_dur(seconds: float) -> str:
+    return str(timedelta(seconds=int(seconds)))
+
+
 # ---- splitting -------------------------------------------------------------
 
 def split_pdf(src: Path, chunk_pages: int, parts_root: Path) -> tuple[int, list[tuple[int, Path]]]:
@@ -153,9 +286,19 @@ def convert_chunk(part_dir: Path, out_root: Path, extra_flags: list[str]) -> Pat
            "--workers", "1"]
     if marker_supports("--disable_tqdm"):
         cmd.append("--disable_tqdm")
+    # Equation recognition has no surya env var -- it is a marker processor
+    # config -- so it has to come in as a flag, and the flag is only present
+    # on some 1.x builds. Probe rather than assume; asserting a flag that does
+    # not exist makes click exit non-zero on every chunk.
+    if gpu_vram_gb() and gpu_vram_gb() < CAP_BELOW_VRAM_GB:
+        for flag in ("--equation_batch_size",
+                     "--EquationProcessor_equation_batch_size"):
+            if marker_supports(flag):
+                cmd += [flag, EQUATION_BATCH_SIZE]
+                break
     cmd += extra_flags
 
-    subprocess.run(cmd, check=True)
+    run_streaming(cmd, marker_env())
     if not md.is_file():
         raise FileNotFoundError(f"marker produced no markdown at {md}")
     sentinel.write_text("ok\n", encoding="utf-8")
@@ -175,6 +318,8 @@ def process_book(src: Path, out_root: Path, chunk_pages: int, scratch: Path,
         print(f"[skip] {src.name} (already converted)")
         return
 
+    book_t0 = time.monotonic()
+
     # Stable per-book workdir, NOT wiped on entry: that is what makes a
     # re-run after a crash resume instead of starting the book over.
     workdir = book_workdir(scratch, src, chunk_pages)
@@ -182,14 +327,34 @@ def process_book(src: Path, out_root: Path, chunk_pages: int, scratch: Path,
     workdir.mkdir(parents=True, exist_ok=True)
 
     n_pages, chunks = split_pdf(src, chunk_pages, parts_root)
-    print(f"[book] {src.name}: {n_pages} pages -> {len(chunks)} chunk(s)")
+    stamp(f"[book] {src.name}: {n_pages} pages -> {len(chunks)} chunk(s)")
 
     stitched: list[str] = []
     images: list[tuple[Path, str]] = []
+    # Timings feed the ETA below. Only chunks actually converted in THIS run
+    # count: a resumed run skips finished chunks in milliseconds, and letting
+    # those into the mean would predict the rest of the book finishing almost
+    # immediately.
+    durations: list[float] = []
     for i, (offset, part_dir) in enumerate(chunks, 1):
         last = min(offset + chunk_pages, n_pages) - 1
-        print(f"  [chunk {i}/{len(chunks)}] pages {offset}-{last}")
+        stamp(f"  [chunk {i}/{len(chunks)}] pages {offset}-{last}")
+        t0 = time.monotonic()
         md = convert_chunk(part_dir, chunk_out_root, extra_flags)
+        elapsed = time.monotonic() - t0
+
+        if elapsed < 1.0:
+            stamp(f"  [chunk {i}/{len(chunks)}] already done, skipped")
+        else:
+            durations.append(elapsed)
+            mean = sum(durations) / len(durations)
+            remaining = len(chunks) - i
+            msg = f"  [chunk {i}/{len(chunks)}] took {fmt_dur(elapsed)}"
+            if remaining:
+                eta = datetime.now() + timedelta(seconds=mean * remaining)
+                msg += (f" | mean {fmt_dur(mean)} | {remaining} left"
+                        f" | book ETA ~{eta:%H:%M} (+{fmt_dur(mean * remaining)})")
+            stamp(msg)
 
         # rstrip + "\n\n" guards against the next chunk's {N}---- marker landing
         # mid-line: PAGE_MARKER is line-anchored on both sides of the pipeline,
@@ -209,7 +374,8 @@ def process_book(src: Path, out_root: Path, chunk_pages: int, scratch: Path,
 
     if not keep_scratch:
         shutil.rmtree(workdir, ignore_errors=True)
-    print(f"  [done] {final_md}  ({len(images)} images)")
+    stamp(f"  [done] {final_md}  ({len(images)} images,"
+          f" {fmt_dur(time.monotonic() - book_t0)})")
 
 
 def main():
@@ -224,8 +390,32 @@ def main():
                     help="keep per-chunk output for inspection instead of deleting it")
     ap.add_argument("--force-ocr", action="store_true")
     ap.add_argument("--use-llm", action="store_true")
+    ap.add_argument("--log", type=Path, default=None,
+                    help="tee all output (this script's and marker's) to this file")
     args = ap.parse_args()
 
+    # Opened append, not write: a resumed run is the normal case for this
+    # script, and truncating would throw away the log of the run that died --
+    # which is the one you actually want to read.
+    log_fh = None
+    if args.log:
+        args.log.parent.mkdir(parents=True, exist_ok=True)
+        log_fh = args.log.open("a", encoding="utf-8", errors="replace")
+        sys.stdout = Tee(sys.stdout, log_fh)
+        sys.stderr = Tee(sys.stderr, log_fh)
+        print(f"\n{'=' * 70}\n"
+              f"run started {datetime.now():%Y-%m-%d %H:%M:%S} :: "
+              f"{' '.join(sys.argv)}\n{'=' * 70}")
+
+    try:
+        run(args)
+    finally:
+        if log_fh:
+            sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
+            log_fh.close()
+
+
+def run(args) -> None:
     check_marker_version()
 
     extra = []
@@ -256,6 +446,21 @@ def main():
     print(f"{len(books)} book(s) to process (smallest first)")
     print(f"scratch: {scratch}")
 
+    # Record the batch sizes in effect. Whether the caps applied is the first
+    # thing you want to know when a chunk runs long, and inferring it after
+    # the fact means reading GPU counters on a live process.
+    vram = gpu_vram_gb()
+    if not vram:
+        print("gpu: none detected (CPU path); leaving surya's CPU defaults alone")
+    elif vram < CAP_BELOW_VRAM_GB:
+        caps = ", ".join(f"{k.split('_BATCH')[0].lower()}={marker_env()[k]}"
+                         for k in BATCH_CAPS)
+        print(f"gpu: {vram}GB (<{CAP_BELOW_VRAM_GB}GB) -- capping batch sizes "
+              f"marker would leave at CUDA defaults: {caps}")
+    else:
+        print(f"gpu: {vram}GB -- marker applies its own caps; not overriding")
+
+    run_t0 = time.monotonic()
     failed = []
     for src in books:
         try:
@@ -272,6 +477,7 @@ def main():
 
     if not args.keep_scratch:
         shutil.rmtree(scratch, ignore_errors=True)   # only ever our own subdir
+    stamp(f"all books done in {fmt_dur(time.monotonic() - run_t0)}")
     print(f"\nDone -> {args.out}/  (open one file and confirm the page markers look like "
           f"'{{N}}----...' before you index)")
 

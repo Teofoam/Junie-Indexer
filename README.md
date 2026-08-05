@@ -167,18 +167,29 @@ JunieLib/
    ```powershell
    python extract_chunked.py --raw raw --out md
    python extract_chunked.py --raw raw --out md --force-ocr   # for scanned books
+   python extract_chunked.py --raw raw --out md --log run.log # overnight runs
    ```
    Use `extract_chunked.py`, not `extract.py`, for anything book-sized. Marker
    renders **every page of a document to a 192-DPI bitmap in RAM before
    converting** (~13 MB/page): a 1000-page textbook commits >13 GB, dies with
    `MemoryError`, and the poisoned worker then fails every later file on
-   tiny allocations — `--workers 1` guards VRAM but nothing guards system RAM.
+   tiny allocations — and `--workers 1` guards *neither* ceiling. It caps how
+   many documents convert at once, but nothing guards system RAM, and it does
+   not touch inference batch sizes at all (see the VRAM gotcha below).
    The chunked wrapper splits each PDF into 150-page chunks (`--chunk-pages`),
    converts each in a **fresh marker subprocess** (~6 GB peak, fully returned to
    the OS on exit), and stitches the chunks back with global page numbering —
    `{N}` markers and `_page_N_…` image names are offset to true PDF page
-   indices, so citations stay correct. Runs smallest-book-first.
+   indices, so citations stay correct. It also caps surya's batch sizes on
+   cards under 14 GB, which marker itself does not. Runs smallest-book-first.
    `extract.py` remains for single papers, where whole-file conversion is fine.
+
+   **Use `--log` on any run you won't be watching.** It tees this script's
+   output, marker's, and any traceback into one file, and prints per-chunk
+   durations with a running ETA — without it a long chunk is indistinguishable
+   from a hung one until you go read GPU counters off the live process.
+   The file is appended, not truncated, so a resumed run keeps the log of the
+   run that died.
 
    **Resume is per-chunk, not per-book.** Finished chunks get a `.chunk_done`
    sentinel, so a crash on chunk 7 of a 1000-page textbook re-does only chunk 7
@@ -377,6 +388,43 @@ printed there corrupts the framing.
   server's dimension check exists to catch.
 - **8 GB VRAM.** Marker (~5 GB) and Whisper large-v3 (~4.7 GB) don't co-reside.
   Sequence them; that's why they're separate scripts.
+- **Marker skips its own VRAM caps on cards under 14 GB.**
+  `marker/utils/batch.py` computes `workers = max(1, vram // 7)` and returns
+  *no* batch-size overrides when `workers == 1`, so its conservative numbers
+  apply only when the card can hold two 7 GB workers. This 8151 MiB card reads
+  as `int(8151/1024)` = **7 GB**, lands on the `workers == 1` branch, and gets
+  surya's raw CUDA defaults instead: recognition **256**, ocr_error 64,
+  detection 36, layout/table_rec 32. `--workers 1` does not help —
+  `convert.py` fixes the batch sizes *before* applying the workers override.
+  `extract_chunked.py` therefore sets `RECOGNITION_BATCH_SIZE=64`,
+  `DETECTOR_BATCH_SIZE=8`, `LAYOUT_BATCH_SIZE=12`, `TABLE_REC_BATCH_SIZE=12`,
+  `OCR_ERROR_BATCH_SIZE=12` (marker's own safe values) below 14 GB, via
+  `setdefault` so an explicit export still wins, and logs which branch it took.
+  **What this does not do is make conversion faster** — see below.
+- **The caps did not change throughput, and the cause of slow conversion is
+  unsettled.** Measured, one 150-page chunk of dense textbook: **57:30 with the
+  caps** against a **59:09 mean without them** — inside the normal per-chunk
+  spread (37:25–77:57), so no effect either way. The VRAM spill is real and
+  measured (7.46 GB dedicated plus **1.82 GB paged into shared host memory**,
+  GPU reading 99% utilization at 41 W of a 50 W cap, clocks at 2790/3090 MHz),
+  but it does not explain the speed, and neither do model weights: all five
+  models total **~3.3 GB on disk** against 7.46 GB resident, most of the rest
+  being PyTorch's caching allocator holding blocks it never returns.
+  What actually predicts runtime is **content density**: dense textbook pages
+  run **0.042 pp/s** while light pages (*Ray Tracing in One Weekend*) run
+  **0.93 pp/s** — a 20× spread at identical settings. A plausible unverified
+  explanation is that surya 0.17's recognition model is an autoregressive
+  decoder and decode is memory-bandwidth-bound, which produces exactly this
+  high-utilization/low-wattage signature. If that is right, cutting
+  recognition batch from 256 to 64 may *cost* throughput, since large batches
+  amortize bandwidth. **Untested.** The clean experiment is one fixed
+  150-page chunk run with the caps on and off, one variable, same book.
+- **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is a no-op on Windows.**
+  The obvious thing to reach for when VRAM spills, and it does nothing here:
+  `c10/cuda/CUDAAllocatorConfig.h` hard-returns `false` unless
+  `PYTORCH_C10_DRIVER_API_SUPPORTED` is defined, which gates the Linux-only CUDA
+  driver-API path and is absent from this build's headers. You get one
+  `TORCH_WARN_ONCE` and no behavior change. Cap the batch sizes instead.
 - **PDF page ≠ printed page. Unresolved.** Marker numbers PDF pages, but a
   textbook's printed numbering starts after front matter, so `p. 239` in a
   citation may be printed page 225. Running headers are stripped from the output
