@@ -175,6 +175,16 @@ def process_file(path: Path, default_kind: str, exact: dict, globs: list, col, e
     src_id = meta.get("source_id") or slug(path.stem)
     kind   = meta.get("type") or default_kind
 
+    # Marker numbers PDF pages from 0; a book's printed numbering starts after
+    # its front matter, so `p. 239` in a citation is not PDF page 239. Subtract
+    # the per-book offset to cite what is actually printed on the page.
+    # Bad or missing values must not poison the index, so anything unparseable
+    # degrades to 0 (cite the PDF page) rather than raising mid-run.
+    try:
+        page_offset = int(str(meta.get("page_offset", "")).strip() or 0)
+    except ValueError:
+        page_offset = 0
+
     # A series row covers many files: each file is a `part`, which keeps
     # timestamps scoped to their own lecture AND keeps chunk ids unique.
     part = path.stem.strip() if is_series else ""
@@ -193,7 +203,14 @@ def process_file(path: Path, default_kind: str, exact: dict, globs: list, col, e
         if part:
             m["part"] = part
         if c["page_start"] is not None:            # Chroma rejects None values
-            m["page_start"], m["page_end"] = c["page_start"], c["page_end"]
+            # page_* is the PRINTED page -- library_mcp renders it straight into
+            # "p. N", so it has to be the number the reader would look for.
+            # pdf_page_* keeps the physical index, which is what you need to
+            # actually open the file at the right place; storing only one of the
+            # two would make either citing or locating impossible.
+            m["page_start"] = c["page_start"] - page_offset
+            m["page_end"]   = c["page_end"] - page_offset
+            m["pdf_page_start"], m["pdf_page_end"] = c["page_start"], c["page_end"]
         if c["time_start"] is not None:
             m["time_start"], m["time_end"] = c["time_start"], c["time_end"]
         metas.append(m)

@@ -406,7 +406,10 @@ printed there corrupts the framing.
   caps** against a **59:09 mean without them** — inside the normal per-chunk
   spread (37:25–77:57), so no effect either way. The VRAM spill is real and
   measured (7.46 GB dedicated plus **1.82 GB paged into shared host memory**,
-  GPU reading 99% utilization at 41 W of a 50 W cap, clocks at 2790/3090 MHz),
+  GPU reading 99% utilization at 41 W while its enforced limit is **115 W** —
+  `nvidia-smi -q -d POWER` shows Current 115 W, Default 50 W, so the card is
+  drawing a third of what it may and is not power-throttled at all — clocks
+  meanwhile at 2790/3090 MHz),
   but it does not explain the speed, and neither do model weights: all five
   models total **~3.3 GB on disk** against 7.46 GB resident, most of the rest
   being PyTorch's caching allocator holding blocks it never returns.
@@ -425,11 +428,28 @@ printed there corrupts the framing.
   `PYTORCH_C10_DRIVER_API_SUPPORTED` is defined, which gates the Linux-only CUDA
   driver-API path and is absent from this build's headers. You get one
   `TORCH_WARN_ONCE` and no behavior change. Cap the batch sizes instead.
-- **PDF page ≠ printed page. Unresolved.** Marker numbers PDF pages, but a
-  textbook's printed numbering starts after front matter, so `p. 239` in a
-  citation may be printed page 225. Running headers are stripped from the output
-  (`--keep_pagefooter_in_output` defaults False), so the printed number isn't
-  recoverable from the markdown — it needs a per-book `page_offset` column in
-  `manifest.csv` and one subtraction in `process_file`. The offset is constant
-  per book, so this is cheap to add and expensive to retrofit: fixing it later
-  means re-indexing. Check one citation against the real PDF during the pilot.
+- **PDF page ≠ printed page. Handled, but only for 15 of 23 books.** Marker
+  numbers PDF pages from 0, while a book's printed numbering starts after its
+  front matter. `manifest.csv` carries a per-book `page_offset`;
+  `process_file` subtracts it so `page_start`/`page_end` — what
+  `library_mcp.py` renders as `p. N` — is the **printed** page, and keeps the
+  physical index in `pdf_page_start`/`pdf_page_end` so you can still open the
+  file at the right place.
+
+  **The offset is NOT constant for every book**, contrary to what this section
+  used to claim. Verified counterexamples: `patterson-hennessy` interleaves
+  online-only `.e` pages and runs at offset 100 by p397 but 136 by p511;
+  `hwu-mppp` drifts 22 → 18 → 17; `hennessy-patterson`'s appendices are
+  numbered `A-38`, `C-66`, `F-45`, which no integer can express. Those books
+  and five others sit at `0`, meaning their citations are PDF pages — wrong,
+  but wrong in a single obvious direction rather than plausibly-wrong.
+
+  Offsets were derived by sampling ten body pages per PDF and reading the folio
+  out of the running head/foot, accepting a value only when ≥6 agreed. **Do not
+  use embedded PDF page labels for this** — `get_page_label()` produced
+  confident answers that disagreed with the actual printed folios on 4 of the
+  8 books spot-checked. Re-derive with the same majority-vote method if you add
+  books; a wrong offset is worse than none, because it looks right.
+- **`26. Numerical Mathematics and Computing` is a scan** — zero characters
+  extract across ten sample pages, so it has no text layer. It needs its own
+  `--force-ocr` pass, and no `page_offset` is recoverable from it without OCR.
