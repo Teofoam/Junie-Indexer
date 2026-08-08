@@ -20,6 +20,7 @@ chroma/
 _chunk_scratch/
 session-log-*.md
 *.log
+run_extract.cmd
 
 # ==========================================
 # 3. Python 运行时垃圾与虚拟环境
