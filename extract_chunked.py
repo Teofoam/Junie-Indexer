@@ -42,7 +42,7 @@ a speed fix -- see the throughput gotcha in the README.
 Requires marker-pdf 1.x. 2.x routes OCR through a VLM inference server
 (vLLM in Docker), which this wrapper does not drive -- see README.
 """
-import argparse, hashlib, os, re, shutil, subprocess, sys, time
+import argparse, hashlib, os, re, shutil, subprocess, sys, threading, time
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -212,7 +212,125 @@ class Tee:
         return self.stream.isatty()
 
 
-def run_streaming(cmd: list[str], env: dict) -> None:
+class _ProcessTree:
+    """Context manager that guarantees a child's DESCENDANTS die with it.
+
+    marker runs its converter in a multiprocessing worker, so the tree is
+    `marker.exe -> python (CLI) -> python (spawn worker)`. Waiting on the
+    direct child is not enough: on 2026-08-08 a worker hit MemoryError,
+    marker caught it, logged it, and exited **zero**, leaving that worker
+    alive holding 15.9GB of commit and a CUDA context. The next two books
+    then failed within a minute each, starved by the leak, and the run
+    finally wedged for 80 minutes. Killing only on non-zero exit would not
+    have caught any of it -- the exit code was 0.
+
+    Windows: a job object with KILL_ON_JOB_CLOSE. Closing the handle kills
+    everything still in the job, whatever the exit code was.
+    POSIX: a new session, so the whole group can be signalled.
+
+    Caveat: the child is assigned to the job just after it starts, not
+    created suspended, so a grandchild spawned in that first instant could
+    escape. marker spends seconds importing torch before it forks anything,
+    so the race is not close in practice.
+    """
+
+    def __init__(self):
+        self._job = None
+
+    def __enter__(self):
+        if os.name == "nt":
+            self._job = _make_kill_on_close_job()
+        return self
+
+    def spawn(self, cmd, env):
+        kwargs = {}
+        if os.name != "nt":
+            kwargs["start_new_session"] = True
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+            env=env, **kwargs)
+        self._proc = proc
+        if self._job:
+            _assign_to_job(self._job, proc.pid)
+        return proc
+
+    def __exit__(self, *exc):
+        if self._job:
+            import ctypes
+            ctypes.windll.kernel32.CloseHandle(self._job)   # kills the job
+            self._job = None
+        else:
+            import signal
+            try:
+                os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, AttributeError):
+                pass
+        return False
+
+
+def _make_kill_on_close_job():
+    import ctypes, ctypes.wintypes as w
+
+    class _BASIC(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", w.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", w.DWORD),
+                    ("Affinity", ctypes.POINTER(ctypes.c_ulong)),
+                    ("PriorityClass", w.DWORD),
+                    ("SchedulingClass", w.DWORD)]
+
+    class _IOC(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint64) for n in
+                    ("ReadOperationCount", "WriteOperationCount",
+                     "OtherOperationCount", "ReadTransferCount",
+                     "WriteTransferCount", "OtherTransferCount")]
+
+    class _EXT(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", _BASIC), ("IoInfo", _IOC),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    # restype must be set explicitly: ctypes defaults to c_int, which silently
+    # truncates a 64-bit HANDLE. Handles are usually small enough to survive
+    # that, which is exactly what makes it a bug you find at 3am and not in a
+    # test.
+    k32 = ctypes.windll.kernel32
+    k32.CreateJobObjectW.restype = w.HANDLE
+    k32.OpenProcess.restype = w.HANDLE
+    k32.CloseHandle.argtypes = [w.HANDLE]
+    k32.AssignProcessToJobObject.argtypes = [w.HANDLE, w.HANDLE]
+    k32.SetInformationJobObject.argtypes = [w.HANDLE, ctypes.c_int,
+                                            ctypes.c_void_p, w.DWORD]
+    job = k32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    info = _EXT()
+    info.BasicLimitInformation.LimitFlags = 0x2000   # KILL_ON_JOB_CLOSE
+    if not k32.SetInformationJobObject(job, 9, ctypes.byref(info),
+                                       ctypes.sizeof(info)):
+        k32.CloseHandle(job)
+        return None
+    return job
+
+
+def _assign_to_job(job, pid) -> None:
+    import ctypes, ctypes.wintypes as w
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = w.HANDLE
+    # PROCESS_SET_QUOTA | PROCESS_TERMINATE
+    h = k32.OpenProcess(0x0100 | 0x0001, False, pid)
+    if h:
+        k32.AssignProcessToJobObject(job, h)
+        k32.CloseHandle(h)
+
+
+def run_streaming(cmd: list[str], env: dict, timeout_s: float | None = None) -> None:
     """Run cmd, relaying output line by line, and raise on non-zero exit.
 
     Streamed rather than captured: a chunk takes the better part of an hour,
@@ -220,15 +338,39 @@ def run_streaming(cmd: list[str], env: dict) -> None:
     until the end -- exactly when it stops being useful. Writing to
     sys.stdout (not the file directly) keeps Tee as the single place that
     decides where output goes.
+
+    stdout is drained by a thread rather than the main loop so the wait can
+    carry a timeout. Iterating the pipe in the main thread is what let a
+    wedged marker hang the run for 80 minutes with the parent at zero CPU:
+    there was no output to end the iteration and nothing watching the clock.
     """
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, encoding="utf-8", errors="replace",
-                            bufsize=1, env=env)
-    for line in proc.stdout:
-        sys.stdout.write(line)
-    rc = proc.wait()
-    if rc != 0:
-        raise subprocess.CalledProcessError(rc, cmd)
+    with _ProcessTree() as tree:
+        proc = tree.spawn(cmd, env)
+
+        def pump():
+            try:
+                for line in proc.stdout:
+                    sys.stdout.write(line)
+            except (ValueError, OSError):
+                pass            # pipe closed under us by a kill; not an error
+
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+        try:
+            rc = proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise TimeoutError(
+                f"chunk exceeded {fmt_dur(timeout_s)} with no exit; "
+                f"killed. Raise --chunk-timeout if this was legitimate.")
+        finally:
+            reader.join(timeout=10)
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+        if rc != 0:
+            raise subprocess.CalledProcessError(rc, cmd)
 
 
 def fmt_dur(seconds: float) -> str:
@@ -265,7 +407,8 @@ def split_pdf(src: Path, chunk_pages: int, parts_root: Path) -> tuple[int, list[
     return n, chunks
 
 
-def convert_chunk(part_dir: Path, out_root: Path, extra_flags: list[str]) -> Path:
+def convert_chunk(part_dir: Path, out_root: Path, extra_flags: list[str],
+                  timeout_s: float | None = None) -> Path:
     """Convert one chunk folder, skipping it if a previous run finished it."""
     stem = part_dir.name
     chunk_out = out_root / stem
@@ -298,7 +441,7 @@ def convert_chunk(part_dir: Path, out_root: Path, extra_flags: list[str]) -> Pat
                 break
     cmd += extra_flags
 
-    run_streaming(cmd, marker_env())
+    run_streaming(cmd, marker_env(), timeout_s)
     if not md.is_file():
         raise FileNotFoundError(f"marker produced no markdown at {md}")
     sentinel.write_text("ok\n", encoding="utf-8")
@@ -311,7 +454,8 @@ def offset_page_refs(text: str, offset: int) -> str:
 
 
 def process_book(src: Path, out_root: Path, chunk_pages: int, scratch: Path,
-                 extra_flags: list[str], keep_scratch: bool = False) -> None:
+                 extra_flags: list[str], keep_scratch: bool = False,
+                 timeout_s: float | None = None) -> None:
     book_out = out_root / src.stem
     final_md = book_out / f"{src.stem}.md"
     if final_md.is_file():
@@ -340,7 +484,7 @@ def process_book(src: Path, out_root: Path, chunk_pages: int, scratch: Path,
         last = min(offset + chunk_pages, n_pages) - 1
         stamp(f"  [chunk {i}/{len(chunks)}] pages {offset}-{last}")
         t0 = time.monotonic()
-        md = convert_chunk(part_dir, chunk_out_root, extra_flags)
+        md = convert_chunk(part_dir, chunk_out_root, extra_flags, timeout_s)
         elapsed = time.monotonic() - t0
 
         if elapsed < 1.0:
@@ -392,6 +536,9 @@ def main():
     ap.add_argument("--use-llm", action="store_true")
     ap.add_argument("--log", type=Path, default=None,
                     help="tee all output (this script's and marker's) to this file")
+    ap.add_argument("--chunk-timeout", type=float, default=720,
+                    help="minutes before a wedged chunk is killed (0 = no limit); "
+                         "default 720 is ~2x the slowest chunk observed")
     args = ap.parse_args()
 
     # Opened append, not write: a resumed run is the normal case for this
@@ -464,7 +611,8 @@ def run(args) -> None:
     failed = []
     for src in books:
         try:
-            process_book(src, args.out, args.chunk_pages, scratch, extra, args.keep_scratch)
+            process_book(src, args.out, args.chunk_pages, scratch, extra,
+                         args.keep_scratch, (args.chunk_timeout or 0) * 60 or None)
         except Exception as e:
             print(f"  [FAIL] {src.name}: {e}", file=sys.stderr)
             failed.append(src.name)
