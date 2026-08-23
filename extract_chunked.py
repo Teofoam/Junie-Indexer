@@ -74,6 +74,14 @@ IMAGE_EXTS = (".jpeg", ".jpg", ".png", ".webp", ".gif")
 # These are marker's own safe values, sized for a ~7GB budget, which is what a
 # single worker on an 8GB card actually has. Applied as env defaults so an
 # explicit setting in the caller's shell still wins.
+# Briefly dropped to 16/4/6/6/6 on 2026-08-22 chasing a VRAM theory, then
+# restored. Do not re-tighten them for that reason: 2-second GPU telemetry showed
+# peak VRAM of 7755MiB at batch 16 against 7754MiB at batch 64. One mebibyte.
+# nvidia-smi reports what PyTorch's caching allocator has *reserved*, not what is
+# under pressure, so a card reading 95% full here means nothing at all.
+#
+# Smaller batches did not help the bugchecks either (see CRASH_INVESTIGATION.md):
+# runs at 16 and at 64 both died at the same point. They only cost throughput.
 BATCH_CAPS = {
     "RECOGNITION_BATCH_SIZE": "64",
     "DETECTOR_BATCH_SIZE": "8",
