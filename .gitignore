@@ -20,7 +20,8 @@ chroma/
 _chunk_scratch/
 session-log-*.md
 *.log
-run_extract.cmd
+*.log.*
+run_extract*.cmd
 
 # ==========================================
 # 3. Python 运行时垃圾与虚拟环境
@@ -47,3 +48,6 @@ env/
 *.swp
 .DS_Store
 Thumbs.db
+raw_probe/
+md_probe/
+_torchpatch/
