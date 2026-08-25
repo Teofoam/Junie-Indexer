@@ -39,6 +39,7 @@ Env vars:
   LIBRARY_EMBED_*       backend/model/device -- see embedder.py
   LIBRARY_ALLOW_EMPTY=1 downgrade the empty-index check to a warning (testing)
   LIBRARY_STRICT_META=0 downgrade metadata mismatches to warnings
+  LIBRARY_MIN_SCORE     relevance floor for search hits (default 0.6)
 """
 from __future__ import annotations
 import json
@@ -58,6 +59,16 @@ META_FILE     = Path(CHROMA_PATH) / "index_meta.json"
 MAX_K         = 12
 SNIPPET_CHARS = 1200
 SCAN_PAGE     = 10_000          # fallback source-scan page size
+
+# Relevance floor. Vector search is nearest-neighbour, not matching: it always
+# returns k results, however far away they are. Without a floor, asking about a
+# topic the library does not cover returns the least-irrelevant passage in it,
+# and the "no results means say so" contract below can never fire on an
+# unfiltered query -- turning the honesty rule into a source of confident
+# nonsense. Measured on this index: genuine hits score 0.72-0.86, while an
+# off-topic control ("baroque harpsichord tuning") pulled Fourier transforms at
+# 0.575. 0.6 sits in that gap. Raise it if unrelated passages still get through.
+MIN_SCORE     = float(os.environ.get("LIBRARY_MIN_SCORE", "0.6"))
 
 ALLOW_EMPTY   = os.environ.get("LIBRARY_ALLOW_EMPTY", "0") not in ("0", "", "false", "False")
 STRICT_META   = os.environ.get("LIBRARY_STRICT_META", "1") not in ("0", "", "false", "False")
@@ -182,7 +193,7 @@ if _meta:
                  "Re-index, or set LIBRARY_STRICT_META=0 if you are certain.")
 
 _log(f"ready: {_n_chunks} chunks, {_probe_dim}-d, model={_model_id}, "
-     f"backend={_backend}, chroma={CHROMA_PATH}")
+     f"backend={_backend}, min_score={MIN_SCORE}, chroma={CHROMA_PATH}")
 
 mcp = FastMCP("library")
 
@@ -268,6 +279,11 @@ def search_library(query: str, k: int = 5, kind: str = "",
         kind: Optional filter — "book", "paper", or "lecture".
         source_id: Optional filter to a single source, e.g. "hartley-zisserman".
             Use list_sources() to see valid ids.
+
+    Passages below a relevance floor are withheld, so "nothing relevant" is a
+    real answer and not a failure: trust it and say the library does not cover
+    the topic, rather than reaching for memory. Fewer results than k means the
+    weaker ones were withheld, which is a hint that coverage is thin.
     """
     k = max(1, min(int(k), MAX_K))
 
@@ -288,20 +304,40 @@ def search_library(query: str, k: int = 5, kind: str = "",
     docs  = res.get("documents", [[]])[0]
     metas = res.get("metadatas", [[]])[0]
     dists = res.get("distances", [[]])[0]
-    if not ids:
-        # The index is known non-empty (checked at startup), so an empty result
-        # here really does mean "not covered" -- safe for Junie to say so.
-        filt = ""
-        if kind or source_id:
-            filt = f" (filtered to {kind or ''}{' ' if kind and source_id else ''}{source_id or ''})"
-        return (f"No matching passages in the library{filt}. Say so plainly rather "
-                "than answering from memory, or retry with a differently-worded "
-                "query or without the filter.")
 
-    out = [f'{len(ids)} passage(s) for "{query}":\n']
-    for cid, doc, m, d in zip(ids, docs, metas, dists):
+    filt = ""
+    if kind or source_id:
+        filt = f" (filtered to {kind or ''}{' ' if kind and source_id else ''}{source_id or ''})"
+
+    if not ids:
+        # Nothing came back at all: only possible when a kind/source_id filter
+        # excluded everything, since the index is non-empty (checked at startup).
+        return (f"No passages matched the filter{filt}. Retry without the filter, "
+                "or call list_sources() for valid ids -- do not answer from memory.")
+
+    # Chroma returns nearest-first, so anything under the floor is a suffix.
+    hits = [(c, d_, m, 1 - dist) for c, d_, m, dist in zip(ids, docs, metas, dists)
+            if 1 - dist >= MIN_SCORE]
+
+    if not hits:
+        best = 1 - dists[0]
+        return (f"Nothing in the library is relevant to \"{query}\"{filt}. "
+                f"The closest passage scored {best:.3f}, below the {MIN_SCORE} "
+                "relevance floor, so it was withheld rather than shown as if it "
+                "supported an answer. Say plainly that the library does not cover "
+                "this, rather than answering from memory. If you believe it should "
+                "be covered, retry with different wording or call list_sources().")
+
+    dropped = len(ids) - len(hits)
+    head = f'{len(hits)} passage(s) for "{query}"'
+    if dropped:
+        # Thin coverage is a signal worth passing on, not noise to hide.
+        head += (f" ({dropped} weaker match(es) withheld below the "
+                 f"{MIN_SCORE} floor -- coverage here may be thin)")
+    out = [head + ":\n"]
+    for cid, doc, m, score in hits:
         text = doc if len(doc) <= SNIPPET_CHARS else doc[:SNIPPET_CHARS] + " […]"
-        out.append(f"--- [{1 - d:.3f}] {_citation(m)}\n"
+        out.append(f"--- [{score:.3f}] {_citation(m)}\n"
                    f"    chunk_id: {cid}\n{text}\n")
     out.append("Cite the source line above for anything you use. "
                "Call get_passage(chunk_id) to read more around a hit.")
