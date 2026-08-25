@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "library": {
+      "command": "${JUNIELIB_PYTHON:-python}",
+      "args": [
+        "library_mcp.py"
+      ],
+      "env": {
+        "LIBRARY_CHROMA_PATH": "${LIBRARY_CHROMA_PATH:-chroma}",
+        "LIBRARY_COLLECTION": "library",
+        "LIBRARY_EMBED_BACKEND": "st",
+        "LIBRARY_EMBED_MODEL": "nomic-ai/nomic-embed-text-v1.5",
+        "LIBRARY_EMBED_DEVICE": "cpu",
+        "LIBRARY_STRICT_META": "1"
+      }
+    }
+  }
+}
