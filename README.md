@@ -5,7 +5,7 @@ knowledge base that Junie queries over one scoped MCP tool.
 
 | | |
 |---|---|
-| **Code lives in** | `F:\Dev\Identities\Aluminum\Projects\JunieLib` (PyCharm project) |
+| **Code lives in** | the `JunieLib` project directory (PyCharm project) |
 | **Runs in** | the `JunieAirport` mamba env — Python 3.13, `torch 2.13.0+cu130`, RTX 5060 Laptop (8 GB) |
 | **Ships to** | Junie's **Cozy-Library** disk on the Linux Mint VM |
 
@@ -312,13 +312,17 @@ Move `md/`, `transcripts/`, and **`chroma/` including `index_meta.json`** to the
 Cozy-Library disk, along with `library_mcp.py` and `embedder.py`.
 
 ```bash
-pip install "mcp[cli]" chromadb==1.5.9 sentence-transformers
+pip install "mcp[cli]<2" chromadb==1.5.9 sentence-transformers
 hf download nomic-ai/nomic-embed-text-v1.5
 ```
 
 Pin chromadb to the same version the index was built with — a major-version skew
 is one of the things the server checks and refuses to start on. Note the CLI is
 `hf`, not `huggingface-cli`, on huggingface_hub 1.x.
+
+**`mcp` must be `<2`.** A bare `pip install "mcp[cli]"` now resolves to 2.x, where
+`FastMCP` has been replaced by `MCPServer` under a restructured API, and
+`library_mcp.py` dies on its import line before any of the startup checks run.
 
 `library_mcp.py` embeds queries **on CPU in-process** — one short query per search,
 so no GPU and no daemon are needed there. After the model is cached, the whole
@@ -344,11 +348,74 @@ error, not an empty shelf.
 | `LIBRARY_COLLECTION` | collection name (default `library`) |
 | `LIBRARY_EMBED_BACKEND` | `st` (default) or `ollama` — must match how the index was built |
 | `LIBRARY_EMBED_DEVICE` | `cpu` on the VM |
+| `LIBRARY_MIN_SCORE` | relevance floor for search hits (default `0.6`) |
 | `LIBRARY_ALLOW_EMPTY=1` | start on an empty index anyway (testing only) |
 | `LIBRARY_STRICT_META=0` | downgrade metadata mismatches to warnings |
 
 Diagnostics go to **stderr** — stdout is the MCP JSON-RPC transport, so anything
 printed there corrupts the framing.
+
+### The relevance floor
+
+The startup contract above stops the server serving an empty shelf. `MIN_SCORE`
+stops it serving a *full* one badly.
+
+Vector search is nearest-neighbour, not matching: it returns `k` rows however far
+away they are, so an unfiltered query can never come back empty and the "say it
+isn't in the library" instruction could never fire. Measured on the 23-book index,
+"baroque harpsichord tuning temperament" returned a passage on Fourier transforms
+at **0.575**, while genuine hits score **0.72–0.86**. Junie would have cited it.
+
+`0.6` sits in that gap. Hits below it are withheld, and three outcomes that used to
+look identical are now distinct:
+
+| Result | What Junie is told |
+|---|---|
+| hits above the floor | normal output, unchanged |
+| some below | strong ones returned, plus how many were withheld — a thin-coverage signal |
+| none above | names the closest score and that it was withheld; say the library doesn't cover it |
+| filter matched nothing | separate message pointing at `list_sources()` |
+
+That last row matters on its own: a mistyped `source_id` used to produce "not in
+the library", which would have Junie deny a book that is sitting in the index.
+
+Re-tune with `LIBRARY_MIN_SCORE` if your corpus scores differently — the number is
+calibrated against *this* index, not a universal constant.
+
+## Serving the library on the host
+
+The VM is the intended home, but the server runs against the freshly built
+`chroma/` directory in place, which is useful for testing retrieval before copying
+anything. `.mcp.json` in the repo root wires it up over stdio.
+
+The committed config is deliberately path-free so it starts on any machine:
+
+| Key | Value |
+|---|---|
+| `command` | `${JUNIELIB_PYTHON:-python}` |
+| `args` | `library_mcp.py` (relative to the project root) |
+| `LIBRARY_CHROMA_PATH` | `${LIBRARY_CHROMA_PATH:-chroma}` |
+
+Set `JUNIELIB_PYTHON` to an interpreter that has `mcp<2`, `chromadb` and
+`sentence-transformers` installed. A bare `python` from `PATH` is the fallback, but
+on Windows that often resolves to the Microsoft Store stub, which will fail.
+
+Machine-specific values belong in `.claude/settings.local.json`, which is
+gitignored:
+
+```json
+{
+  "env": {
+    "JUNIELIB_PYTHON": "C:\\path\\to\\env\\python.exe",
+    "LIBRARY_CHROMA_PATH": "C:\\path\\to\\JunieLib\\chroma"
+  }
+}
+```
+
+`LIBRARY_EMBED_DEVICE` is pinned to `cpu` in the committed config. The embedder
+resolves `auto` to CUDA when a card is present, and on the machine this was built
+on that bugchecks the box within minutes — see `CRASH_INVESTIGATION.md`. Queries
+are one short embedding each, so CPU costs nothing noticeable here regardless.
 
 ## Tuning knobs (top of `chunk_and_index.py`)
 
@@ -367,6 +434,11 @@ printed there corrupts the framing.
   `openai` 1.x, `anthropic` 0.46, `google-genai` 1.x, pypdfium2 4.30. The
   embedder is verified unaffected, but any *other* script sharing `JunieAirport`
   that uses those SDKs directly gets the older majors.
+- **`mcp` is pinned `<2`.** `library_mcp.py` imports `FastMCP` from
+  `mcp.server.fastmcp`; in 2.x that is gone, replaced by `MCPServer` under a
+  restructured API, so a bare `pip install "mcp[cli]"` produces a server that
+  fails on its import line before a single startup check runs. Porting to 2.x is
+  a deliberate rewrite, not a version bump.
 - **System RAM, not just VRAM, is a ceiling.** Marker's up-front page rendering
   is why `extract_chunked.py` exists; peak commit scales with `--chunk-pages`
   (~13 MB/page at 192 DPI plus the models), not with book size. **Measured: 150
