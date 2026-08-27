@@ -215,6 +215,21 @@ def process_file(path: Path, default_kind: str, exact: dict, globs: list, col, e
             m["time_start"], m["time_end"] = c["time_start"], c["time_end"]
         metas.append(m)
 
+    # Clear this document's previous chunks before writing, so re-indexing one
+    # file is idempotent instead of colliding on ids. Delete rather than upsert:
+    # if the new version chunks into FEWER pieces, upsert would leave the tail of
+    # the old version behind as orphans that still answer searches.
+    #
+    # Scope matters. A series row covers many files under one source_id, so
+    # deleting by source_id alone would wipe every other lecture and leave only
+    # the one being re-indexed.
+    if ids:
+        try:
+            col.delete(where={"$and": [{"source_id": src_id}, {"part": part}]}
+                       if part else {"source_id": src_id})
+        except Exception as e:                      # empty collection, no match
+            print(f"  (nothing to clear for {doc_id}: {e})", file=sys.stderr)
+
     for s in range(0, len(ids), ADD_BATCH):
         sl = slice(s, s + ADD_BATCH)
         col.add(ids=ids[sl], documents=docs[sl],
@@ -236,6 +251,11 @@ def main():
     ap.add_argument("--chroma",      type=Path, default=Path("chroma"))
     ap.add_argument("--dry-run",     action="store_true",
                     help="report how each file resolves against the manifest; no embedding")
+    ap.add_argument("--only",        action="append", metavar="PATTERN",
+                    help="index only files whose filename stem or source_id matches "
+                         "this glob (repeatable). Everything already in the index is "
+                         "left alone, so adding one book costs one book, not a full "
+                         "rebuild. e.g. --only 'chu-fpga' --only '9. FPGA*'")
     ap.add_argument("--backend",     default="st", choices=["st", "ollama"],
                     help="st = sentence-transformers in-process (default); ollama = HTTP daemon")
     ap.add_argument("--device",      default="auto", choices=["auto", "cuda", "cpu"],
@@ -250,13 +270,30 @@ def main():
         # parts[:-1] so a legitimately-named file like _notes.md still indexes.
         return not any(part.startswith("_") for part in p.relative_to(root).parts[:-1])
 
-    files = []
+    all_files = []
     if args.md.exists():
-        files += [(p, "book")    for p in sorted(args.md.rglob("*.md")) if _not_scratch(p, args.md)]
+        all_files += [(p, "book")    for p in sorted(args.md.rglob("*.md")) if _not_scratch(p, args.md)]
     if args.transcripts.exists():
-        files += [(p, "lecture") for p in sorted(args.transcripts.rglob("*.md")) if _not_scratch(p, args.transcripts)]
-    if not files:
+        all_files += [(p, "lecture") for p in sorted(args.transcripts.rglob("*.md")) if _not_scratch(p, args.transcripts)]
+    if not all_files:
         sys.exit("No .md found in md/ or transcripts/. Run extract.py / transcribe.py first.")
+
+    # --only selects a subset to (re)index. all_files stays whole: the sidecar
+    # describes the index, not this run, and n_files must not shrink to the size
+    # of a one-book top-up.
+    files = all_files
+    if args.only:
+        def _selected(path: Path) -> bool:
+            meta, _ = lookup(path.stem, exact, globs)
+            sid = meta.get("source_id") or slug(path.stem)
+            return any(fnmatch.fnmatch(path.stem, pat) or fnmatch.fnmatch(sid, pat)
+                       for pat in args.only)
+        files = [(p, k) for p, k in all_files if _selected(p)]
+        if not files:
+            sys.exit(f"--only {args.only} matched none of {len(all_files)} file(s). "
+                     "Patterns match the filename stem or the manifest source_id; "
+                     "run --dry-run to see how each file resolves.")
+        print(f"--only: {len(files)} of {len(all_files)} file(s) selected")
 
     if args.dry_run:
         unmatched = 0
@@ -291,6 +328,29 @@ def main():
     # It also gives list_sources() a free source table instead of a full scan.
     model_id = os.environ.get("LIBRARY_EMBED_MODEL") or (
         OLLAMA_MODEL if args.backend == "ollama" else DEFAULT_MODEL)
+
+    meta_path = Path(args.chroma) / "index_meta.json"
+
+    # On a partial run `sources` holds only what was just indexed. Writing that
+    # verbatim would tell library_mcp.list_sources() the library contains one
+    # book while the collection actually holds two dozen -- and list_sources()
+    # is exactly what Junie consults before saying a topic isn't covered.
+    # Merge into the existing table instead; a full run replaces it, so a book
+    # deleted from md/ correctly disappears.
+    if args.only and meta_path.exists():
+        try:
+            prev = {e["source_id"]: e for e in
+                    json.loads(meta_path.read_text(encoding="utf-8")).get("sources", [])}
+            merged = prev | sources          # this run's counts win
+            skipped = len(merged) - len(sources)
+            if skipped:
+                print(f"merged sidecar: {len(sources)} re-indexed, "
+                      f"{skipped} carried over from the previous run")
+            sources = merged
+        except Exception as e:
+            print(f"warning: could not merge previous index_meta.json ({e}); "
+                  f"writing only this run's {len(sources)} source(s)", file=sys.stderr)
+
     meta = {
         "embed_model": model_id,
         "backend": args.backend,
@@ -303,17 +363,20 @@ def main():
         "chromadb": chromadb.__version__,
         "target_words": TARGET_WORDS,
         "overlap_words": OVERLAP_WORDS,
+        # Both describe the whole index, not this run: count() is the live total,
+        # and all_files is every markdown on disk even when --only narrowed the work.
         "n_chunks": col.count(),
-        "n_files": len(files),
+        "n_files": len(all_files),
         "built_at": datetime.datetime.now(datetime.timezone.utc)
                     .isoformat(timespec="seconds"),
         "sources": sorted(sources.values(), key=lambda e: e["source_id"]),
     }
-    meta_path = Path(args.chroma) / "index_meta.json"
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False),
                          encoding="utf-8")
 
-    print(f"\nDone. {total} chunks from {len(files)} files -> {args.chroma}/")
+    print(f"\nDone. {total} chunks from {len(files)} file(s) -> {args.chroma}/"
+          f"  (index now holds {meta['n_chunks']} chunks "
+          f"across {len(meta['sources'])} source(s))")
     print(f"Wrote {meta_path}  (model={model_id}, dim={meta['dim']}, "
           f"chromadb={meta['chromadb']}) — copy it to the VM with the index.")
 
